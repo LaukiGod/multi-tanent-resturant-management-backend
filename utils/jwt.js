@@ -3,6 +3,10 @@ const jwt = require("jsonwebtoken");
 /** Sentinel slug used by the platform (SUPER_ADMIN) login flow. */
 const PLATFORM_SCOPE = "__platform__";
 
+/** Sentinel slug for the shared staff sign-in at /admin, where the restaurant is
+ *  worked out from the Google account rather than from the URL. */
+const STAFF_SCOPE = "__staff__";
+
 const sign = (payload) =>
   jwt.sign(payload, process.env.JWT_SECRET, { expiresIn: process.env.JWT_EXPIRES_IN || "8h" });
 
@@ -39,7 +43,32 @@ const verifyOAuthState = (state) => {
   return payload;
 };
 
+/**
+ * Short-lived ticket for someone who is staff at more than one restaurant. It
+ * lists the restaurants they may pick from; exchanging it for a real access
+ * token happens in POST /api/auth/staff/select. It carries no role, and
+ * `authenticate` refuses any token with a `purpose`, so it can never be used
+ * as an access token itself.
+ */
+const STAFF_SELECT_PURPOSE = "staff-select";
+
+const signStaffSelectTicket = (email, choices) =>
+  jwt.sign({ purpose: STAFF_SELECT_PURPOSE, email, choices }, process.env.JWT_SECRET, {
+    expiresIn: "10m",
+  });
+
+const verifyStaffSelectTicket = (ticket) => {
+  const payload = jwt.verify(ticket, process.env.JWT_SECRET);
+  if (payload?.purpose !== STAFF_SELECT_PURPOSE || !Array.isArray(payload.choices)) {
+    throw new Error("Not a restaurant selection ticket");
+  }
+  return payload;
+};
+
 module.exports = {
+  signStaffSelectTicket,
+  verifyStaffSelectTicket,
+  STAFF_SCOPE,
   sign,
   verify,
   signStaffToken,

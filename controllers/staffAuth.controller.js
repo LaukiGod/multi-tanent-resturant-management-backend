@@ -1,5 +1,13 @@
 const Staff = require("../entities/staff.entity");
-const { signStaffToken, signOAuthState, PLATFORM_SCOPE } = require("../utils/jwt");
+const {
+  signStaffToken,
+  signOAuthState,
+  verifyOAuthState,
+  signStaffSelectTicket,
+  verifyStaffSelectTicket,
+  PLATFORM_SCOPE,
+  STAFF_SCOPE,
+} = require("../utils/jwt");
 
 const frontendBase = () => String(process.env.FRONTEND_URL || "").replace(/\/+$/, "");
 
@@ -11,7 +19,14 @@ exports.oauthStateFor = (slug) => signOAuthState(slug);
  * Issue a tenant-stamped JWT and bounce to that tenant's callback route.
  */
 exports.googleCallback = (req, res) => {
-  const { staff, restaurant, slug } = req.user;
+  const { staff, restaurant, slug, choices, email } = req.user;
+
+  // Shared /admin sign-in, staff at several restaurants: let them pick one.
+  if (choices) {
+    const ticket = signStaffSelectTicket(email, choices);
+    return res.redirect(`${frontendBase()}/admin/choose?ticket=${encodeURIComponent(ticket)}`);
+  }
+
   const token = signStaffToken(staff, restaurant);
 
   const target =
@@ -20,6 +35,56 @@ exports.googleCallback = (req, res) => {
       : `${frontendBase()}/r/${slug}/auth/callback`;
 
   res.redirect(`${target}?token=${token}`);
+};
+
+/**
+ * Where a failed Google sign-in is sent: back to the login page it started from,
+ * with the reason, instead of a bare JSON error. The start page is read from the
+ * signed OAuth state; if that is missing or expired, fall back to /admin.
+ */
+exports.loginFailureUrl = (req, reason) => {
+  let target = `${frontendBase()}/admin`;
+  try {
+    const { slug } = verifyOAuthState(req.query.state);
+    if (slug === PLATFORM_SCOPE) target = `${frontendBase()}/platform/login`;
+    else if (slug !== STAFF_SCOPE) target = `${frontendBase()}/r/${slug}/login`;
+  } catch {
+    /* expired or missing state: keep the /admin fallback */
+  }
+  const message = reason || "Google sign-in failed or was cancelled";
+  return `${target}?error=${encodeURIComponent(message)}`;
+};
+
+/**
+ * Staff at several restaurants: exchange the selection ticket for an access
+ * token at the restaurant they picked. Re-checks the staff row and restaurant,
+ * since either may have been deactivated since the ticket was issued.
+ */
+exports.selectRestaurant = async (req, res) => {
+  try {
+    const { ticket, slug } = req.body || {};
+    let payload;
+    try {
+      payload = verifyStaffSelectTicket(ticket);
+    } catch {
+      return res.status(401).json({ message: "Sign-in expired. Please sign in again." });
+    }
+
+    const choice = payload.choices.find((c) => c.slug === slug);
+    if (!choice) return res.status(403).json({ message: "You do not have access to that restaurant" });
+
+    const staff = await Staff.findById(choice.staffId).populate("restaurant");
+    if (!staff || !staff.isActive || staff.email !== payload.email || !staff.restaurant) {
+      return res.status(403).json({ message: "You no longer have access to that restaurant" });
+    }
+    if (staff.restaurant.status !== "active") {
+      return res.status(403).json({ message: "This restaurant is suspended" });
+    }
+
+    res.json({ token: signStaffToken(staff, staff.restaurant), slug: staff.restaurant.slug });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 };
 
 exports.googleFailure = (req, res) => {

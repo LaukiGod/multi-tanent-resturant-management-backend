@@ -7,7 +7,13 @@ const authenticate = (req, res, next) => {
   }
 
   try {
-    req.staff = verify(header.split(" ")[1]);
+    const payload = verify(header.split(" ")[1]);
+    // Only access tokens carry a role. OAuth state and restaurant-selection
+    // tickets are signed with the same secret but must never authenticate.
+    if (!payload?.role || payload.purpose) {
+      return res.status(401).json({ message: "Invalid or expired token" });
+    }
+    req.staff = payload;
     next();
   } catch {
     return res.status(401).json({ message: "Invalid or expired token" });
