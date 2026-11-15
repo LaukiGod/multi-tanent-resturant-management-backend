@@ -1,16 +1,98 @@
-const { sign } = require("../utils/jwt");
 const Staff = require("../entities/staff.entity");
+const {
+  signStaffToken,
+  signOAuthState,
+  verifyOAuthState,
+  signStaffSelectTicket,
+  verifyStaffSelectTicket,
+  PLATFORM_SCOPE,
+  STAFF_SCOPE,
+} = require("../utils/jwt");
 
-// Called after Google OAuth2 succeeds — issues JWT, redirects frontend
+const frontendBase = () => String(process.env.FRONTEND_URL || "").replace(/\/+$/, "");
+
+/** Step 1 — hand Passport a signed `state` carrying the tenant slug. */
+exports.oauthStateFor = (slug) => signOAuthState(slug);
+
+/**
+ * Step 2 — Google came back and Passport resolved `{ staff, restaurant, slug }`.
+ * Issue a tenant-stamped JWT and bounce to that tenant's callback route.
+ */
 exports.googleCallback = (req, res) => {
-  const staff = req.user;
-  const token = sign({ id: staff._id, role: staff.role, name: staff.name, email: staff.email });
+  const { staff, restaurant, slug, choices, email } = req.user;
 
-  const frontendURL = process.env.FRONTEND_URL;
-  res.redirect(`${frontendURL}/auth/callback?token=${token}`);
+  // Shared /admin sign-in, staff at several restaurants: let them pick one.
+  if (choices) {
+    const ticket = signStaffSelectTicket(email, choices);
+    return res.redirect(`${frontendBase()}/admin/choose?ticket=${encodeURIComponent(ticket)}`);
+  }
+
+  const token = signStaffToken(staff, restaurant);
+
+  const target =
+    slug === PLATFORM_SCOPE
+      ? `${frontendBase()}/platform/auth/callback`
+      : `${frontendBase()}/r/${slug}/auth/callback`;
+
+  res.redirect(`${target}?token=${token}`);
 };
 
-// ADMIN only: pre-register a staff email + role before they log in with Google
+/**
+ * Where a failed Google sign-in is sent: back to the login page it started from,
+ * with the reason, instead of a bare JSON error. The start page is read from the
+ * signed OAuth state; if that is missing or expired, fall back to /admin.
+ */
+exports.loginFailureUrl = (req, reason) => {
+  let target = `${frontendBase()}/admin`;
+  try {
+    const { slug } = verifyOAuthState(req.query.state);
+    if (slug === PLATFORM_SCOPE) target = `${frontendBase()}/platform/login`;
+    else if (slug !== STAFF_SCOPE) target = `${frontendBase()}/r/${slug}/login`;
+  } catch {
+    /* expired or missing state: keep the /admin fallback */
+  }
+  const message = reason || "Google sign-in failed or was cancelled";
+  return `${target}?error=${encodeURIComponent(message)}`;
+};
+
+/**
+ * Staff at several restaurants: exchange the selection ticket for an access
+ * token at the restaurant they picked. Re-checks the staff row and restaurant,
+ * since either may have been deactivated since the ticket was issued.
+ */
+exports.selectRestaurant = async (req, res) => {
+  try {
+    const { ticket, slug } = req.body || {};
+    let payload;
+    try {
+      payload = verifyStaffSelectTicket(ticket);
+    } catch {
+      return res.status(401).json({ message: "Sign-in expired. Please sign in again." });
+    }
+
+    const choice = payload.choices.find((c) => c.slug === slug);
+    if (!choice) return res.status(403).json({ message: "You do not have access to that restaurant" });
+
+    const staff = await Staff.findById(choice.staffId).populate("restaurant");
+    if (!staff || !staff.isActive || staff.email !== payload.email || !staff.restaurant) {
+      return res.status(403).json({ message: "You no longer have access to that restaurant" });
+    }
+    if (staff.restaurant.status !== "active") {
+      return res.status(403).json({ message: "This restaurant is suspended" });
+    }
+
+    res.json({ token: signStaffToken(staff, staff.restaurant), slug: staff.restaurant.slug });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
+};
+
+exports.googleFailure = (req, res) => {
+  const reason = req.query.reason || "Google authentication failed or access denied";
+  res.status(401).json({ message: reason });
+};
+
+// ADMIN only: pre-register a staff email + role, scoped to the caller's restaurant.
 exports.registerStaff = async (req, res) => {
   try {
     const { name, email, role } = req.body;
@@ -22,25 +104,42 @@ exports.registerStaff = async (req, res) => {
       return res.status(400).json({ message: "Role must be ADMIN or STAFF" });
     }
 
-    const exists = await Staff.findOne({ email });
-    if (exists) return res.status(409).json({ message: "Email already registered" });
+    const normalized = String(email).toLowerCase().trim();
+    const exists = await Staff.findOne({ restaurant: req.restaurantId, email: normalized });
+    if (exists) {
+      return res.status(409).json({ message: "Email already registered at this restaurant" });
+    }
 
-    // googleId stays unset until they first log in with Google — must be omitted, not
-    // set to null, or the sparse unique index collides once a second staff is pre-registered.
-    const staff = await Staff.create({ name, email, role });
-    res.status(201).json({ message: "Staff pre-registered", id: staff._id, role: staff.role, email: staff.email });
+    // googleId is null until they first log in with Google
+    const staff = await Staff.create({
+      restaurant: req.restaurantId,
+      name,
+      email: normalized,
+      role,
+      googleId: null,
+    });
+
+    res.status(201).json({
+      message: "Staff pre-registered",
+      id: staff._id,
+      role: staff.role,
+      email: staff.email,
+    });
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// ADMIN only: deactivate (soft delete) — keeps history
+/** Every staff mutation below is filtered by restaurant, so one tenant's ADMIN
+ *  cannot touch another tenant's staff even with a valid id. */
+const findInTenant = (req) => ({ _id: req.params.id, restaurant: req.restaurantId });
+
 exports.deactivateStaff = async (req, res) => {
   try {
     if (req.params.id === req.staff.id) {
       return res.status(400).json({ message: "Cannot deactivate your own account" });
     }
-    const staff = await Staff.findByIdAndUpdate(req.params.id, { isActive: false }, { new: true });
+    const staff = await Staff.findOneAndUpdate(findInTenant(req), { isActive: false }, { new: true });
     if (!staff) return res.status(404).json({ message: "Staff not found" });
     res.json({ message: "Staff deactivated", id: staff._id });
   } catch (err) {
@@ -48,10 +147,9 @@ exports.deactivateStaff = async (req, res) => {
   }
 };
 
-// ADMIN only: reactivate
 exports.activateStaff = async (req, res) => {
   try {
-    const staff = await Staff.findByIdAndUpdate(req.params.id, { isActive: true }, { new: true });
+    const staff = await Staff.findOneAndUpdate(findInTenant(req), { isActive: true }, { new: true });
     if (!staff) return res.status(404).json({ message: "Staff not found" });
     res.json({ message: "Staff activated", id: staff._id });
   } catch (err) {
@@ -59,13 +157,12 @@ exports.activateStaff = async (req, res) => {
   }
 };
 
-// ADMIN only: hard delete
 exports.deleteStaff = async (req, res) => {
   try {
     if (req.params.id === req.staff.id) {
       return res.status(400).json({ message: "Cannot delete your own account" });
     }
-    const staff = await Staff.findByIdAndDelete(req.params.id);
+    const staff = await Staff.findOneAndDelete(findInTenant(req));
     if (!staff) return res.status(404).json({ message: "Staff not found" });
     res.json({ message: "Staff deleted", id: req.params.id });
   } catch (err) {
@@ -73,17 +170,21 @@ exports.deleteStaff = async (req, res) => {
   }
 };
 
-// ADMIN only: list all staff
 exports.listStaff = async (req, res) => {
   try {
-    const staff = await Staff.find({}, "-googleId").sort({ createdAt: -1 });
+    const staff = await Staff.find({ restaurant: req.restaurantId }, "-googleId").sort({
+      createdAt: -1,
+    });
     res.json(staff);
   } catch (err) {
     res.status(500).json({ message: err.message });
   }
 };
 
-// Get own profile (any authenticated staff)
+// Own profile, plus the restaurant this session is bound to.
 exports.me = (req, res) => {
-  res.json(req.staff);
+  res.json({
+    ...req.staff,
+    restaurant: req.restaurant ? req.restaurant.toPublicJSON() : null,
+  });
 };

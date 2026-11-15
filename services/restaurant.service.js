@@ -1,14 +1,17 @@
-const Order = require("../entities/order.entity");
-const Dish = require("../entities/dish.entity");
-const Inventory = require("../entities/inventory.entity");
-const Table = require("../entities/table.entity");
-const User = require("../entities/user.entity");
+/**
+ * Staff/admin operations for a single restaurant.
+ *
+ * Every exported function takes `db` — the tenant-scoped model bundle produced by
+ * `scoped(restaurantId)` in the tenant middleware. Nothing in this file imports a
+ * Mongoose model directly, so no query here can reach another tenant's data.
+ */
 const { checkAllergyRisk } = require("../utils/allergyChecker");
 const { generateTableToken } = require("../utils/tableToken");
 const mongoose = require("mongoose");
 
 const escapeRegex = (value) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 const ORDER_STATUSES = ["created", "confirmed", "preparing", "served", "completed"];
+const LINE_ITEM_STATUSES = ["queued", "preparing", "ready", "served"];
 /** When the whole order's status changes, cascade this status to every line item. */
 const ORDER_TO_LINE_ITEM_STATUS = {
   created: "queued",
@@ -17,6 +20,7 @@ const ORDER_TO_LINE_ITEM_STATUS = {
   served: "served",
   completed: "served"
 };
+
 const isHttpUrl = (value) => {
   if (!value) return false;
   try {
@@ -44,7 +48,7 @@ const normalizeAllergies = (raw) => {
   return [];
 };
 
-const resolveDishIds = async (rawDishes) => {
+const resolveDishIds = async (db, rawDishes) => {
   const dishList = Array.isArray(rawDishes) ? rawDishes : [];
   const normalizedTokens = dishList
     .map((v) => (v === null || v === undefined ? "" : String(v).trim()))
@@ -67,7 +71,8 @@ const resolveDishIds = async (rawDishes) => {
   if (numericCandidates.length) or.push({ dishId: { $in: numericCandidates } });
   if (!or.length) throw new Error("One or more dishes not found");
 
-  const dishDocs = await Dish.find({ $or: or, isAvailable: { $ne: false } });
+  // Scoped: a dish id belonging to another restaurant simply will not resolve.
+  const dishDocs = await db.Dish.find({ $or: or, isAvailable: { $ne: false } });
   const lookup = new Map();
   for (const dish of dishDocs) {
     lookup.set(String(dish._id), dish);
@@ -85,13 +90,13 @@ function lineItemsFromDishIds(resolvedDishIds) {
   return resolvedDishIds.map((dishId) => ({ dish: dishId, status: "queued" }));
 }
 
-exports.getOrders = async () => {
+exports.getOrders = async (db) => {
   const startOfDay = new Date();
   startOfDay.setHours(0, 0, 0, 0);
   const endOfDay = new Date();
   endOfDay.setHours(23, 59, 59, 999);
 
-  return await Order.find({
+  return await db.Order.find({
     createdAt: { $gte: startOfDay, $lte: endOfDay }
   })
     .populate("dishes")
@@ -99,14 +104,14 @@ exports.getOrders = async () => {
     .sort({ createdAt: -1 });
 };
 
-exports.updateOrderStatus = async (data) => {
+exports.updateOrderStatus = async (db, data) => {
   const { orderId, status } = data;
 
   if (!ORDER_STATUSES.includes(status)) {
     throw new Error(`Invalid status. Must be one of: ${ORDER_STATUSES.join(", ")}`);
   }
 
-  const order = await Order.findById(orderId);
+  const order = await db.Order.findById(orderId);
   if (!order) throw new Error("Order not found");
 
   order.status = status;
@@ -119,12 +124,12 @@ exports.updateOrderStatus = async (data) => {
 
   await order.save();
 
-  const populated = await Order.findById(order._id).populate("dishes").populate("lineItems.dish");
+  const populated = await db.Order.findById(order._id).populate("dishes").populate("lineItems.dish");
 
   return { message: "Order status updated", order: populated || order };
 };
 
-exports.createOrder = async (data) => {
+exports.createOrder = async (db, data) => {
   const tableNo = Number(data?.tableNo);
   const dishes = Array.isArray(data?.dishes) ? data.dishes : [];
   const customerName = String(data?.customerName || "Walk-in").trim() || "Walk-in";
@@ -137,18 +142,18 @@ exports.createOrder = async (data) => {
   if (!Array.isArray(dishes) || dishes.length === 0) throw new Error("dishes must be a non-empty array");
   if (phoneNo && !/^\d{10}$/.test(phoneNo)) throw new Error("phoneNo must be exactly 10 digits");
 
-  // Ensure table exists
-  let table = await Table.findOne({ tableNo });
-  if (!table) table = await Table.create({ tableNo, token: generateTableToken() });
+  // Ensure table exists (staff action — trusted to add a table on the fly)
+  let table = await db.Table.findOne({ tableNo });
+  if (!table) table = await db.Table.create({ tableNo, token: generateTableToken() });
 
   // Ensure there is a currentUser to attach allergies/session info
   let user = null;
   if (table.currentUser) {
-    user = await User.findById(table.currentUser);
+    user = await db.User.findById(table.currentUser);
   }
 
   if (!user) {
-    user = await User.create({ tableNo, name: customerName, phoneNo, allergies: allergiesInput, role: "user" });
+    user = await db.User.create({ tableNo, name: customerName, phoneNo, allergies: allergiesInput, role: "user" });
     table.currentUser = user._id;
   } else if (allergiesInput.length) {
     user.allergies = allergiesInput;
@@ -165,12 +170,12 @@ exports.createOrder = async (data) => {
   await table.save();
 
   // Validate dishes and compute allergy flag
-  const { resolvedDishIds, dishDocs } = await resolveDishIds(dishes);
+  const { resolvedDishIds, dishDocs } = await resolveDishIds(db, dishes);
 
   const ingredientNames = dishDocs.flatMap((d) => d.ingredients || []);
   const allergyResult = await checkAllergyRisk(user.allergies || [], ingredientNames);
 
-  const order = await Order.create({
+  const order = await db.Order.create({
     tableNo,
     dishes: resolvedDishIds,
     lineItems: lineItemsFromDishIds(resolvedDishIds),
@@ -181,10 +186,10 @@ exports.createOrder = async (data) => {
 
   // Propagate table allergy alert if needed
   if (order.allergyAlert) {
-    await Table.findOneAndUpdate({ tableNo }, { allergyAlert: true }, { new: true });
+    await db.Table.findOneAndUpdate({ tableNo }, { allergyAlert: true }, { new: true });
   }
 
-  const populated = await Order.findById(order._id).populate("dishes").populate("lineItems.dish");
+  const populated = await db.Order.findById(order._id).populate("dishes").populate("lineItems.dish");
 
   return {
     message: "Order created by staff",
@@ -193,11 +198,11 @@ exports.createOrder = async (data) => {
   };
 };
 
-exports.updateOrderDetails = async (data) => {
+exports.updateOrderDetails = async (db, data) => {
   const { orderId } = data || {};
   if (!orderId) throw new Error("orderId is required");
 
-  const order = await Order.findById(orderId);
+  const order = await db.Order.findById(orderId);
   if (!order) throw new Error("Order not found");
 
   const nextDishes = Array.isArray(data?.dishes) ? data.dishes : null;
@@ -217,12 +222,12 @@ exports.updateOrderDetails = async (data) => {
 
   let dishDocs = null;
   if (nextDishes) {
-    const resolved = await resolveDishIds(nextDishes);
+    const resolved = await resolveDishIds(db, nextDishes);
     dishDocs = resolved.dishDocs;
     order.dishes = resolved.resolvedDishIds;
     order.lineItems = lineItemsFromDishIds(resolved.resolvedDishIds);
   } else {
-    dishDocs = await Dish.find({ _id: { $in: order.dishes } });
+    dishDocs = await db.Dish.find({ _id: { $in: order.dishes } });
   }
 
   if (hasAllergyField) {
@@ -235,22 +240,20 @@ exports.updateOrderDetails = async (data) => {
 
   await order.save();
 
-  await Table.findOneAndUpdate(
+  await db.Table.findOneAndUpdate(
     { tableNo: order.tableNo },
     { allergyAlert: Boolean(order.allergyAlert) },
     { new: true }
   );
 
-  const updatedOrder = await Order.findById(order._id).populate("dishes").populate("lineItems.dish");
+  const updatedOrder = await db.Order.findById(order._id).populate("dishes").populate("lineItems.dish");
   return {
     message: "Order details updated",
     order: updatedOrder || order
   };
 };
 
-const LINE_ITEM_STATUSES = ["queued", "preparing", "ready", "served"];
-
-exports.updateLineItemStatus = async (data) => {
+exports.updateLineItemStatus = async (db, data) => {
   const { orderId, lineIndex, status } = data || {};
   if (!orderId) throw new Error("orderId is required");
   if (lineIndex === undefined || lineIndex === null || Number(lineIndex) < 0) {
@@ -260,7 +263,7 @@ exports.updateLineItemStatus = async (data) => {
     throw new Error(`Invalid status. Must be one of: ${LINE_ITEM_STATUSES.join(", ")}`);
   }
 
-  const order = await Order.findById(orderId);
+  const order = await db.Order.findById(orderId);
   if (!order) throw new Error("Order not found");
 
   if (!order.lineItems?.length && order.dishes?.length) {
@@ -277,18 +280,18 @@ exports.updateLineItemStatus = async (data) => {
   order.markModified("lineItems");
   await order.save();
 
-  const populated = await Order.findById(orderId).populate("dishes").populate("lineItems.dish");
+  const populated = await db.Order.findById(orderId).populate("dishes").populate("lineItems.dish");
   return { message: "Line item updated", order: populated };
 };
 
-exports.getAllergyAlerts = async () => {
-  const orderAlerts = await Order.find({
+exports.getAllergyAlerts = async (db) => {
+  const orderAlerts = await db.Order.find({
     allergyAlert: true
   })
     .populate("dishes")
     .sort({ createdAt: -1 });
 
-  const tableAlerts = await Table.find({ allergyAlert: true })
+  const tableAlerts = await db.Table.find({ allergyAlert: true })
     .populate("currentUser")
     .sort({ tableNo: 1 });
 
@@ -317,7 +320,7 @@ exports.getAllergyAlerts = async () => {
 
 
 // ============================== Inventory management Start =============================================
-exports.addItemsToInventory = async (data) => {
+exports.addItemsToInventory = async (db, data) => {
   const items = Array.isArray(data) ? data : [data]; // accept single or bulk
 
   if (!items.length) {
@@ -340,9 +343,9 @@ exports.addItemsToInventory = async (data) => {
     throw new Error("Duplicate item names in request");
   }
 
-  // Check if any of these items already exist in DB
-  const existing = await Inventory.find({
-    name: { $in: incomingNames.map(n => new RegExp(`^${n}$`, "i")) }
+  // Check whether any of these already exist FOR THIS RESTAURANT
+  const existing = await db.Inventory.find({
+    name: { $in: incomingNames.map(n => new RegExp(`^${escapeRegex(n)}$`, "i")) }
   });
 
   if (existing.length) {
@@ -350,7 +353,7 @@ exports.addItemsToInventory = async (data) => {
     throw new Error(`Items already exist in inventory: ${existingNames}`);
   }
 
-  const created = await Inventory.insertMany(items);
+  const created = await db.Inventory.insertMany(items);
 
   return {
     message: `${created.length} item(s) added to inventory`,
@@ -358,8 +361,8 @@ exports.addItemsToInventory = async (data) => {
   };
 };
 
-exports.getInventoryItems = async () => {
-  const items = await Inventory.find().sort({ createdAt: -1 });
+exports.getInventoryItems = async (db) => {
+  const items = await db.Inventory.find().sort({ createdAt: -1 });
 
   if (!items.length) {
     return {
@@ -398,21 +401,21 @@ exports.getInventoryItems = async () => {
 
 // ============================== Inventory management End ===============================================
 
-exports.getTables = async () => {
-  const tables = await Table.find().populate("currentUser");
+exports.getTables = async (db) => {
+  const tables = await db.Table.find().populate("currentUser").sort({ tableNo: 1 });
 
   return tables;
 };
 
-exports.getTableCount = async () => {
-  const max = await Table.findOne().sort({ tableNo: -1 }).select({ tableNo: 1 });
+exports.getTableCount = async (db) => {
+  const max = await db.Table.findOne(null, { tableNo: 1 }).sort({ tableNo: -1 });
   return {
     count: max?.tableNo ? Number(max.tableNo) : 0
   };
 };
 
-exports.increaseTableCount = async () => {
-  const max = await Table.findOne().sort({ tableNo: -1 }).select({ tableNo: 1 });
+exports.increaseTableCount = async (db) => {
+  const max = await db.Table.findOne(null, { tableNo: 1 }).sort({ tableNo: -1 });
   const currentMax = max?.tableNo ? Number(max.tableNo) : 0;
   const start = currentMax + 1;
   const end = currentMax + 1;
@@ -423,7 +426,7 @@ exports.increaseTableCount = async () => {
   }
 
   if (toInsert.length) {
-    await Table.insertMany(toInsert, { ordered: true });
+    await db.Table.insertMany(toInsert, { ordered: true });
   }
 
   return {
@@ -434,16 +437,16 @@ exports.increaseTableCount = async () => {
   };
 };
 
-exports.deleteTableById = async (id) => {
+exports.deleteTableById = async (db, id) => {
   if (!mongoose.Types.ObjectId.isValid(id)) {
     throw new Error("Invalid table id");
   }
 
-  const maxBefore = await Table.findOne().sort({ tableNo: -1 }).select({ tableNo: 1 });
+  const maxBefore = await db.Table.findOne(null, { tableNo: 1 }).sort({ tableNo: -1 });
   const currentMax = maxBefore?.tableNo ? Number(maxBefore.tableNo) : 0;
   if (currentMax === 0) throw new Error("No tables exist");
 
-  const table = await Table.findById(id).select({
+  const table = await db.Table.findById(id, {
     tableNo: 1,
     status: 1,
     currentUser: 1,
@@ -470,9 +473,9 @@ exports.deleteTableById = async (id) => {
     );
   }
 
-  await Table.deleteOne({ _id: table._id });
+  await db.Table.deleteOne({ _id: table._id });
 
-  const max = await Table.findOne().sort({ tableNo: -1 }).select({ tableNo: 1 });
+  const max = await db.Table.findOne(null, { tableNo: 1 }).sort({ tableNo: -1 });
   return {
     message: `Table ${table.tableNo} removed`,
     removedId: String(id),
@@ -480,13 +483,13 @@ exports.deleteTableById = async (id) => {
   };
 };
 
-exports.getNotifications = async () => {
+exports.getNotifications = async (db) => {
   const [newOrders, mealCompleted, waiterRequests, allergyOrders, allergyTables] = await Promise.all([
-    Order.countDocuments({ status: { $in: ["created", "confirmed"] } }),
-    Order.countDocuments({ status: "completed" }),
-    Table.countDocuments({ waiterRequested: true }),
-    Order.distinct("tableNo", { allergyAlert: true }),
-    Table.distinct("tableNo", { allergyAlert: true })
+    db.Order.countDocuments({ status: { $in: ["created", "confirmed"] } }),
+    db.Order.countDocuments({ status: "completed" }),
+    db.Table.countDocuments({ waiterRequested: true }),
+    db.Order.distinct("tableNo", { allergyAlert: true }),
+    db.Table.distinct("tableNo", { allergyAlert: true })
   ]);
 
   const allergyAlerts = new Set([...allergyOrders, ...allergyTables].map(Number)).size;
@@ -500,8 +503,8 @@ exports.getNotifications = async () => {
 };
 
 /** Returns the table's QR token, generating and persisting one if it predates the token rollout. */
-exports.getOrCreateTableToken = async (tableNo) => {
-  const table = await Table.findOne({ tableNo }).select({ token: 1 });
+exports.getOrCreateTableToken = async (db, tableNo) => {
+  const table = await db.Table.findOne({ tableNo }).select({ token: 1 });
   if (!table) throw new Error("Table not found");
   if (table.token) return table.token;
 
@@ -510,8 +513,8 @@ exports.getOrCreateTableToken = async (tableNo) => {
   return table.token;
 };
 
-exports.resolveWaiterCall = async (tableNo) => {
-  const table = await Table.findOneAndUpdate(
+exports.resolveWaiterCall = async (db, tableNo) => {
+  const table = await db.Table.findOneAndUpdate(
     { tableNo, waiterRequested: true },
     { waiterRequested: false, lastStatusChangedAt: new Date() },
     { new: true }
@@ -520,15 +523,15 @@ exports.resolveWaiterCall = async (tableNo) => {
   return { message: "Waiter call resolved", table };
 };
 
-exports.markTableAvailable = async (tableNo) => {
+exports.markTableAvailable = async (db, tableNo) => {
   // Freeing the table ends the dining session — any order still in flight for it
   // would otherwise be orphaned (no currentUser, no occupiedSince) and linger forever.
-  const completedOrders = await Order.updateMany(
+  const completedOrders = await db.Order.updateMany(
     { tableNo, status: { $ne: "completed" } },
     { status: "completed" }
   );
 
-  const table = await Table.findOneAndUpdate(
+  const table = await db.Table.findOneAndUpdate(
     { tableNo },
     {
       status: "available",
@@ -548,10 +551,10 @@ exports.markTableAvailable = async (tableNo) => {
   };
 };
 
-exports.getManagerMetrics = async () => {
+exports.getManagerMetrics = async (db) => {
   const [orders, tables] = await Promise.all([
-    Order.find().populate("dishes"),
-    Table.find()
+    db.Order.find().populate("dishes"),
+    db.Table.find()
   ]);
 
   const revenue = orders.reduce(
@@ -585,11 +588,11 @@ exports.getManagerMetrics = async () => {
   };
 };
 
-exports.getAllDishes = async () => {
-  return Dish.find().sort({ createdAt: -1 });
+exports.getAllDishes = async (db) => {
+  return db.Dish.find().sort({ createdAt: -1 });
 };
 
-exports.addDish = async ({ name, price, recipe, ingredients, imageUrl, category, isAvailable }) => {
+exports.addDish = async (db, { name, price, recipe, ingredients, imageUrl, category, isAvailable }) => {
   if (!name || !price) {
     throw new Error("Dish name and price are required");
   }
@@ -610,15 +613,16 @@ exports.addDish = async ({ name, price, recipe, ingredients, imageUrl, category,
   // Recipe is optional (Dish schema defaults to "").
   recipe = recipe == null ? "" : String(recipe);
 
-  const existing = await Dish.findOne({ name: new RegExp(`^${name.trim()}$`, "i") });
+  const existing = await db.Dish.findOne({ name: new RegExp(`^${escapeRegex(name.trim())}$`, "i") });
   if (existing) {
     throw new Error(`A dish named "${existing.name}" already exists. Use the update endpoint to modify it.`);
   }
 
-  const lastDish = await Dish.findOne().sort({ dishId: -1 });
-  const nextDishId = lastDish ? lastDish.dishId + 1 : 1;
+  // dishId counts up per restaurant, so the max is taken within this tenant.
+  const lastDish = await db.Dish.findOne().sort({ dishId: -1 });
+  const nextDishId = lastDish?.dishId ? lastDish.dishId + 1 : 1;
 
-  const dish = new Dish({
+  const dish = await db.Dish.create({
     dishId: nextDishId,
     name: name.trim(),
     category: String(category || "General").trim() || "General",
@@ -629,28 +633,27 @@ exports.addDish = async ({ name, price, recipe, ingredients, imageUrl, category,
     isAvailable: isAvailable === undefined ? true : Boolean(isAvailable)
   });
 
-  await dish.save();
   return dish;
 };
 
-exports.deleteDish = async (id) => {
-  const dish = await Dish.findByIdAndDelete(id);
+exports.deleteDish = async (db, id) => {
+  const dish = await db.Dish.findByIdAndDelete(id);
   if (!dish) throw new Error("Dish not found");
   return { message: `Dish "${dish.name}" deleted successfully` };
 };
 
-exports.deleteInventoryItem = async (id) => {
-  const item = await Inventory.findByIdAndDelete(id);
+exports.deleteInventoryItem = async (db, id) => {
+  const item = await db.Inventory.findByIdAndDelete(id);
   if (!item) throw new Error("Inventory item not found");
   return { message: `"${item.name}" removed from inventory` };
 };
 
-exports.updateInventoryItem = async (id, data) => {
+exports.updateInventoryItem = async (db, id, data) => {
   if (!id) {
     throw new Error("Inventory item ID is required");
   }
 
-  const item = await Inventory.findById(id);
+  const item = await db.Inventory.findById(id);
   if (!item) throw new Error("Inventory item not found");
 
   const updates = {};
@@ -658,7 +661,7 @@ exports.updateInventoryItem = async (id, data) => {
     const nextName = String(data.name || "").trim();
     if (!nextName) throw new Error("Name cannot be empty");
 
-    const existingWithName = await Inventory.findOne({
+    const existingWithName = await db.Inventory.findOne({
       _id: { $ne: id },
       name: new RegExp(`^${escapeRegex(nextName)}$`, "i")
     });
@@ -690,7 +693,7 @@ exports.updateInventoryItem = async (id, data) => {
   return { message: "Inventory item updated successfully", item };
 };
 
-exports.updateDish = async ({ dishId, name, price, recipe, ingredients, imageUrl, category, isAvailable }) => {
+exports.updateDish = async (db, { dishId, name, price, recipe, ingredients, imageUrl, category, isAvailable }) => {
   if (!dishId) {
     throw new Error("dishId is required");
   }
@@ -723,7 +726,7 @@ exports.updateDish = async ({ dishId, name, price, recipe, ingredients, imageUrl
     throw new Error("No fields provided to update");
   }
 
-  const dish = await Dish.findOneAndUpdate(
+  const dish = await db.Dish.findOneAndUpdate(
     { dishId },
     updates,
     { new: true, runValidators: true }
