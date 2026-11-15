@@ -13,8 +13,9 @@ router.get("/restaurant", userController.getRestaurantInfo);
 // login and start a table session
 router.post("/login-table", userController.loginTable);
 
-// quick QR entry
-router.get("/table-select/:tableNo", userController.selectTableQuickBrowse);
+// quick QR entry. :token is the opaque QR token, or a plain table number from
+// the kiosk (staff device) — see resolveTableNo in user.service.js
+router.get("/table-select/:token", userController.selectTableQuickBrowse);
 
 // set allergies for the seated user
 router.post("/set-allergies", userController.setAllergies);

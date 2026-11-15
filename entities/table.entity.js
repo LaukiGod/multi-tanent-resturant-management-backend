@@ -13,6 +13,13 @@ const tableSchema = new mongoose.Schema({
     required: true
   },
 
+  /** Opaque id used in the customer-facing QR link instead of the real table number. Backfilled lazily for legacy rows — omitted (not null) so the sparse unique index allows more than one unbackfilled row. */
+  token: {
+    type: String,
+    unique: true,
+    sparse: true
+  },
+
   status: {
     type: String,
     enum: ["available", "occupied", "cleaning"],

@@ -7,6 +7,7 @@ const path = require("path");
 const Restaurant = require("../entities/restaurant.entity");
 const Staff = require("../entities/staff.entity");
 const { scoped } = require("./tenantScope");
+const { generateTableToken } = require("./tableToken");
 
 const starterDishes = require(path.join(__dirname, "dishes.json"));
 
@@ -39,7 +40,7 @@ async function seedTables(db, count) {
 
   const rows = [];
   for (let tableNo = 1; tableNo <= count; tableNo += 1) {
-    rows.push({ tableNo, status: "available" });
+    rows.push({ tableNo, status: "available", token: generateTableToken() });
   }
   await db.Table.insertMany(rows);
   return rows.length;

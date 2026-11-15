@@ -197,11 +197,17 @@ exports.orderFood = async (db, data) => {
     });
   }
 
-  await db.Table.findOneAndUpdate(
-    { tableNo },
-    { allergyAlert: Boolean(order.allergyAlert) },
-    { new: true }
-  );
+  // Only ever raise the table's flag here, never clear it — the customer's declared
+  // allergies (set via setAllergies) must stay flagged even if THIS particular order's
+  // dishes happen not to match an ingredient keyword. The flag is cleared when the
+  // session actually ends (clearTable / markTableAvailable / completeMeal).
+  if (order.allergyAlert) {
+    await db.Table.findOneAndUpdate(
+      { tableNo },
+      { allergyAlert: true },
+      { new: true }
+    );
+  }
 
   const populated = await db.Order.findById(order._id).populate("dishes").populate("lineItems.dish");
 
@@ -251,8 +257,23 @@ exports.getTableOrders = async (db, tableNo) => {
  * tenant-aware navigate() adds that prefix itself. A caller building an absolute
  * redirect URL from this (see the controller) must add /r/:slug on its own.
  */
-exports.selectTableQuickBrowse = async (db, tableNo) => {
-  const n = Number(tableNo);
+/**
+ * Resolve the public identifier from a QR/kiosk link to a real tableNo, within
+ * this restaurant only. Accepts either a plain table number (the kiosk on a staff
+ * device, which already lists real tableNo values) or the opaque token printed in
+ * table QR codes.
+ */
+const resolveTableNo = async (db, identifier) => {
+  const asNumber = Number(identifier);
+  if (Number.isInteger(asNumber) && asNumber > 0) return asNumber;
+
+  const table = await db.Table.findOne({ token: String(identifier) }).select({ tableNo: 1 });
+  if (!table) throw new Error("Invalid table link");
+  return table.tableNo;
+};
+
+exports.selectTableQuickBrowse = async (db, identifier) => {
+  const n = await resolveTableNo(db, identifier);
   if (!(await isTableValid(db.Table, n))) throw new Error("Invalid table number");
   const table = await db.Table.findOne({ tableNo: n }).populate("currentUser");
   if (!table) throw new Error("Invalid table number");

@@ -11,14 +11,16 @@ const xmlEscape = (value) =>
 
 /**
  * @param {{slug: string, name: string}} restaurant tenant the table belongs to
- * @param {number} tableNo
+ * @param {number} tableNo  printed on the label only
+ * @param {string} token    opaque table token; the QR link never exposes the table number
  */
-exports.generateTableQRCode = async (restaurant, tableNo) => {
+exports.generateTableQRCode = async (restaurant, tableNo, token) => {
   try {
     const serviceUrl = String(process.env.FRONTEND_URL || "").replace(/\/+$/, "");
     // The QR must carry the tenant: the customer app is unauthenticated, so the
-    // slug in the URL is the only thing that says which restaurant this is.
-    const qrText = `${serviceUrl}/r/${restaurant.slug}/user/table-select/${tableNo}`;
+    // slug in the URL is the only thing that says which restaurant this is. The
+    // table is identified by its opaque token, never the real table number.
+    const qrText = `${serviceUrl}/r/${restaurant.slug}/user/table-select/${token}`;
 
     // 1. Generate clean QR
     const qrBuffer = await QRCode.toBuffer(qrText, {

@@ -195,6 +195,15 @@ exports.getNotifications = async (req, res) => {
   }
 };
 
+exports.resolveWaiterCall = async (req, res) => {
+  try {
+    const result = await restaurantService.resolveWaiterCall(req.db, Number(req.params.tableNo));
+    res.status(200).json(result);
+  } catch (error) {
+    res.status(400).json({ message: error.message });
+  }
+};
+
 exports.markTableAvailable = async (req, res) => {
   try {
     const result = await restaurantService.markTableAvailable(req.db, Number(req.params.tableNo));
@@ -218,7 +227,8 @@ exports.getManagerMetrics = async (req, res) => {
 exports.generateTableQRCode = async (req, res) => {
   try {
     const tableNo = Number(req.params.tableNo);
-    const qrCodeData = await generateTableQRCode(req.restaurant, tableNo);
+    const token = await restaurantService.getOrCreateTableToken(req.db, tableNo);
+    const qrCodeData = await generateTableQRCode(req.restaurant, tableNo, token);
     res.set("Content-Type", "image/png");
     res.set("Content-Disposition", `attachment; filename=${req.restaurant.slug}-table-${tableNo}-qr.png`);
     res.status(200).send(qrCodeData);

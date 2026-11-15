@@ -34,6 +34,7 @@ router.delete("/inventory/:id",  adminOnly, restaurantController.deleteInventory
 // the restaurant named in the URL.
 router.get("/tables", restaurantController.getTables);
 router.patch("/tables/:tableNo/available", staff, restaurantController.markTableAvailable);
+router.patch("/tables/:tableNo/resolve-waiter", staff, restaurantController.resolveWaiterCall);
 router.get("/tables/count",     adminOnly, restaurantController.getTableCount);
 router.post("/tables/increase", adminOnly, restaurantController.increaseTableCount);
 router.delete("/tables/:id",    adminOnly, restaurantController.deleteTableById);
