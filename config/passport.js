@@ -70,6 +70,7 @@ passport.use(
         // ── Platform (SUPER_ADMIN) login ──────────────────────────────────────
         if (slug === PLATFORM_SCOPE) {
           let admin = await Staff.findOne({ restaurant: null, email, role: "SUPER_ADMIN" });
+          console.log("[DEBUG]: Platform admin email : admin: ", admin, " , Profile: ", profile)
           if (!admin && email === envPlatformAdminEmail()) {
             admin = await createEnvPlatformAdmin(email, profile);
           }
