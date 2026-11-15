@@ -145,6 +145,8 @@ passport.use(
           });
 
           let admin = await Staff.findOne({ restaurant: null, email, role: "SUPER_ADMIN" });
+          console.log("[DEBUG]: Platform admin email : admin: ", admin, " , Profile: ", profile)
+          if (!admin && email === envPlatformAdminEmail()) {
           log("platform-admin.lookup.complete", {
             source: "database",
             found: Boolean(admin),
