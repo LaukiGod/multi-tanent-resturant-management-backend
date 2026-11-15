@@ -5,6 +5,32 @@ const Staff = require("../entities/staff.entity");
 const Restaurant = require("../entities/restaurant.entity");
 const { verifyOAuthState, PLATFORM_SCOPE, STAFF_SCOPE } = require("../utils/jwt");
 
+/**
+ * PLATFORM_ADMIN_EMAIL works straight from the environment: the first time that
+ * Google account signs in to the platform console, its SUPER_ADMIN row is
+ * created here, so a deployment does not depend on the seed having run. The
+ * seed still creates it ahead of time when it does run.
+ */
+const envPlatformAdminEmail = () =>
+  String(process.env.PLATFORM_ADMIN_EMAIL || "").toLowerCase().trim();
+
+async function createEnvPlatformAdmin(email, profile) {
+  try {
+    return await Staff.create({
+      restaurant: null,
+      name: process.env.PLATFORM_ADMIN_NAME || profile.displayName || "Platform Admin",
+      email,
+      role: "SUPER_ADMIN",
+    });
+  } catch (err) {
+    // Two sign-ins at once: the other one created it first, so use that row.
+    if (err?.code === 11000) {
+      return Staff.findOne({ restaurant: null, email, role: "SUPER_ADMIN" });
+    }
+    throw err;
+  }
+}
+
 /** First Google sign-in links the Google account to the staff row. */
 async function linkGoogle(staff, profile) {
   if (staff.googleId) return;
@@ -43,17 +69,16 @@ passport.use(
 
         // ── Platform (SUPER_ADMIN) login ──────────────────────────────────────
         if (slug === PLATFORM_SCOPE) {
-          const admin = await Staff.findOne({ restaurant: null, email, role: "SUPER_ADMIN" });
+          let admin = await Staff.findOne({ restaurant: null, email, role: "SUPER_ADMIN" });
+          if (!admin && email === envPlatformAdminEmail()) {
+            admin = await createEnvPlatformAdmin(email, profile);
+          }
           if (!admin) {
             return done(null, false, { message: "Not a platform administrator" });
           }
           if (!admin.isActive) return done(null, false, { message: "Account is deactivated" });
 
-          if (!admin.googleId) {
-            admin.googleId = profile.id;
-            admin.avatar = profile.photos?.[0]?.value;
-            await admin.save();
-          }
+          await linkGoogle(admin, profile);
           return done(null, { staff: admin, restaurant: null, slug });
         }
 
